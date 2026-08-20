@@ -1,0 +1,31 @@
+# Local IDX Swing-Trading AI Platform — runtime dependencies
+#
+# Cross-platform: every package below ships wheels for Linux (WSL) and Windows,
+# so `pip install -r requirements.txt` works unchanged on both machines.
+# Never commit or copy a .venv between the two — build one per OS.
+#
+# NOTE: sqlite3 is part of the Python standard library. Do NOT add it here;
+#       `pip install sqlite3` fails with a confusing error.
+
+streamlit>=1.39
+yfinance>=0.2.65
+pandas>=2.2
+numpy>=2.0
+
+# pandas_ta (upstream) requires Python >=3.12 and its 0.3.14b0 fallback breaks on
+# numpy 2 (`from numpy import NaN`). pandas-ta-classic works on Python 3.10 + numpy 2
+# and keeps the same `df.ta.*` API. Imported as `pandas_ta_classic`.
+pandas-ta-classic>=0.6.52
+
+playwright>=1.48
+ollama>=0.4
+plotly>=5.24
+
+# pandas.read_html backends, used by the Reksa Dana scraper
+lxml>=5.0
+beautifulsoup4>=4.12
+
+# Optional: JIT-compiles the SuperTrend inner loop. pandas-ta-classic falls back to a
+# no-op decorator when numba is absent, so this affects speed only, never correctness.
+# Uncomment on machines where the daily scan feels slow.
+# numba>=0.61

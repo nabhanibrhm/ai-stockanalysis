@@ -1,0 +1,33 @@
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtual environments ---------------------------------------------------
+# Build one per OS. A venv is full of absolute paths and native binaries, so a
+# WSL venv is unusable from Windows and vice versa -- never share or commit one.
+.venv/
+venv/
+env/
+
+# --- Local data (per-machine, cheap to regenerate) --------------------------
+# SQLite files must not travel between the two laptops: copying one mid-write
+# invites lock and journal corruption, and prices are one refresh away.
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/raw/
+
+# --- Streamlit --------------------------------------------------------------
+.streamlit/secrets.toml
+
+# --- Editors / OS -----------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

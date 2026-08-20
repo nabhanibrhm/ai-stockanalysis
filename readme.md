@@ -1,6 +1,10 @@
 # Local IDX Swing-Trading AI Platform — Implementation Plan
 
-> Status: planned, not yet implemented. Last updated 2026-08-20.
+> Status: **Phase 1 complete** (scaffold, `requirements.txt`, `config.py`).
+> Phases 2-7 planned. Last updated 2026-08-20.
+>
+> Runs on two machines: Ubuntu/WSL and Windows. See
+> [Cross-platform notes](#cross-platform-notes-wsl--windows).
 
 ## Context
 
@@ -18,15 +22,16 @@ constraints from the previous round.
 
 | Finding | Consequence |
 |---|---|
-| Python **3.10.12**, numpy **2.2.6** | PyPI `pandas_ta` (0.4.71b0) needs Python ≥3.12; pip on 3.10 falls back to 0.3.14b0, which dies on numpy 2 (`from numpy import NaN`). → **`pandas-ta-classic` 0.6.52**, imported as `pandas_ta_classic as ta`, same `df.ta.*` API, has every indicator the spec needs |
+| Python **3.10.12**, numpy **2.2.6** | PyPI `pandas_ta` (0.4.71b0) needs Python ≥3.12; pip on 3.10 falls back to 0.3.14b0, which dies on numpy 2 (`from numpy import NaN`). → **`pandas-ta-classic` 0.6.52**, imported as `pandas_ta_classic as ta`, same `df.ta.*` API. **Verified installed and imported on this Python 3.10.12 / numpy 2.2.6 / pandas 2.2.2 box**, so the dependency choice is no longer an assumption |
 | `sqlite3` is stdlib | Must **not** go in `requirements.txt` — `pip install sqlite3` fails |
 | All 10 watchlist tickers verified live | BBCA 6350, BBRI 3130, BMRI 4150, TLKM 2610, ASII 4750, GOTO 50, ACES 360, BRMS 675, AMMN 4470, UNVR 1795 — 244 rows each, no gaps. `trailingPE`/`priceToBook`/`returnOnEquity` also available |
-| **`ta.atr(length=14)` emits `ATRr_14`, not `ATR_14`** | The name embeds `mamode` ("rma"). Hardcoding `ATR_14` silently KeyErrors — the most likely implementation bug here, and it sits directly on the stop-loss path |
+| **`ta.atr(length=14)` emits `ATRr_14`, not `ATR_14`** | The name embeds `mamode` ("rma"). Hardcoding `ATR_14` silently KeyErrors — the most likely implementation bug here, and it sits directly on the stop-loss path. **Confirmed against live BBCA data**, along with `SUPERTd_7_3.0` (values `{-1.0, 1.0}`) and `SQZ_20_2.0_20_1.5_LB` |
 | `ta.supertrend(7, 3.0)` → `SUPERT_7_3.0`, **`SUPERTd_7_3.0`** (1=bull, −1=bear), `SUPERTl/s_7_3.0` | `SUPERTd` is the signal column the BUY gate reads |
 | `ta.squeeze(lazybear=True)` → `SQZ_20_2.0_20_1.5_LB` + `SQZ_ON`/`SQZ_OFF`/`SQZ_NO` | `lazybear=True` matches the TradingView "Squeeze Momentum [LazyBear]" the spec asks for; default (Carter TTM) drops the `_LB` suffix |
 | `supertrend` is `@njit`-decorated with a no-op fallback if numba is absent | `numba` is optional — correctness unaffected, speed is not. Listed as a commented optional dep |
 | `pasardana.id/robots.txt` disallows `/api/`; fund search renders no `<table>` server-side and shows Login. `reksadana.ojk.go.id` WAF-blocks non-browser requests | Mutual funds keep the adapter + CSV-fallback + sample-seed design; never request `/api/` |
 | `ollama` not installed, `:11434` not listening | Default state until installed — see the offline-resilience note below |
+| **`python3.10-venv` absent on this WSL box** | `python3 -m venv` imports but cannot bootstrap pip (`No module named ensurepip`). Ubuntu/WSL needs `sudo apt install python3.10-venv` first; Windows ships venv working out of the box |
 
 ### Confirmed design decisions
 
@@ -57,6 +62,7 @@ ai-stockanalysis/
 ├── requirements.txt
 ├── readme.md                 # this document
 ├── .gitignore                # .venv/, data/*.db, data/raw/, __pycache__/
+├── .gitattributes            # eol=lf everywhere, so WSL and Windows share one commit
 ├── data/
 │   ├── raw/                  # scraper HTML dumps (--inspect) + user CSV drops
 │   └── sample_mutual_funds.csv
@@ -80,12 +86,28 @@ No extra module beyond the spec's four: the indicator import is isolated inside 
 `stock_data.py` behind one `_COLUMN_MAP`, rather than in a separate `indicators.py`. `scripts/`
 exists only so data refresh runs headlessly without Streamlit.
 
+## Cross-platform notes (WSL + Windows)
+
+The same commit runs on both machines; only the environment differs. What this costs in the code:
+
+| Concern | Handling |
+|---|---|
+| **Paths** | Every path is a `pathlib.Path` anchored to `BASE_DIR = Path(__file__).resolve().parent`, never to the process CWD. `streamlit run app.py` and `python scripts/refresh_prices.py` resolve identically from any directory. |
+| **Line endings** | `.gitattributes` pins `eol=lf` for all text. Without it, a file saved by a Windows editor arrives as CRLF and the other machine sees the entire file as modified. `.bat`/`.ps1` are exempted to CRLF. |
+| **SQLite WAL** | WAL needs shared-memory mmap, which **DrvFs does not support** — a database under `/mnt/c/...` accessed from WSL fails with "disk I/O error". `config._default_journal_mode()` detects WSL + a `/mnt/` database path and falls back to `DELETE`; `IDXAI_SQLITE_JOURNAL_MODE` overrides either way. |
+| **The database itself** | Git-ignored and per-machine, deliberately. Copying a SQLite file between the two invites lock and journal corruption, and prices are one refresh away. |
+| **Virtualenvs** | Never shared or committed — a venv is full of absolute paths and native binaries. Build one per OS. On Ubuntu/WSL, `sudo apt install python3.10-venv` is required first (this box does not have it); Windows ships it working. Activation differs: `.venv/bin/activate` vs `.venv\Scripts\Activate.ps1`. |
+| **Text encoding** | Windows defaults to cp1252, which mangles Indonesian fund names. `config.TEXT_ENCODING` is `"utf-8"` and every file open passes it explicitly. |
+| **Playwright browsers** | Installed per-machine into an OS-specific cache, not into the repo. Run `python -m playwright install chromium` once on each. |
+| **Ollama across the boundary** | WSL2's default NAT networking means `localhost` inside the distro is *not* the Windows host. To share one Ollama on Windows, set `IDXAI_OLLAMA_HOST` to the host IP (`ip route show default`) and `OLLAMA_HOST=0.0.0.0` on the Windows side. With WSL2 mirrored networking (Win 11 22H2+), plain localhost works. Simplest option remains one Ollama per machine. |
+| **Dependencies** | Every package in `requirements.txt` ships wheels for both platforms; `numba` is commented out as optional so no machine needs a compiler. |
+
 ## Build order
 
 Checkpoint after Phase 2 (`requirements.txt` + `config.py` + `stock_data.py`), per the spec's
 initial execution step.
 
-### Phase 1 — `requirements.txt` + `config.py`
+### Phase 1 — `requirements.txt` + `config.py` &nbsp;✅ done
 
 ```
 streamlit>=1.39
@@ -103,8 +125,11 @@ beautifulsoup4>=4.12
 ```
 
 `config.py` — constants only, no side effects beyond `mkdir(parents=True, exist_ok=True)` on
-`data/` and `data/raw/`. Every value env-overridable so trying `qwen2.5` or a different ATR
-multiple needs no code edit.
+`data/` and `data/raw/`. Every value is overridable via an `IDXAI_`-prefixed environment
+variable, so machine-specific differences live in each shell profile and both laptops share one
+commit. Unparseable values fall back to the default rather than crashing at import.
+`python config.py` prints the resolved settings — run it on both machines and diff when they
+disagree.
 
 - `OLLAMA_HOST = "http://localhost:11434"`, `DEFAULT_MODEL = "llama3.2"`,
   `OLLAMA_TEMPERATURE = 0.1`, `OLLAMA_TIMEOUT_S = 180`
@@ -262,15 +287,32 @@ CSV import, and a prominent not-investment-advice disclaimer.
 
 ## Verification
 
-1. **Deps** — `python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt`,
-   then `python -c "import pandas_ta_classic, streamlit, yfinance, plotly, ollama, playwright"`.
-   The one unverified assumption (planning ran no installs). If `pandas-ta-classic` fails on 3.10,
-   replace only the marked indicator section of `stock_data.py` with pandas-native
-   EMA/RSI/MACD/ATR/OBV plus a hand-rolled SuperTrend and Squeeze — `add_indicators()`'s output
-   contract is unchanged, so nothing else moves.
+1. **Deps** — on Ubuntu/WSL, `sudo apt install python3.10-venv` first (this box lacks it, and
+   without it `python3 -m venv` fails with `No module named ensurepip`). Then:
+
+   ```bash
+   python3 -m venv .venv && source .venv/bin/activate     # WSL / Linux
+   pip install -r requirements.txt
+   python -c "import pandas_ta_classic, streamlit, yfinance, plotly, ollama, playwright"
+   ```
+   ```powershell
+   py -m venv .venv; .\.venv\Scripts\Activate.ps1        # Windows
+   pip install -r requirements.txt
+   ```
+   `pandas-ta-classic` 0.6.52 is **already verified** importing on Python 3.10.12 + numpy 2.2.6 +
+   pandas 2.2.2, so the fallback below is contingency, not an expected step. Should it ever break,
+   replace only the marked indicator section of `stock_data.py` with pandas-native EMA/RSI/MACD/
+   ATR/OBV plus a hand-rolled SuperTrend and Squeeze — `add_indicators()`'s output contract is
+   unchanged, so nothing else moves.
+
+   Also run `python config.py` on each machine and confirm `platform`, `journal mode`, and
+   `ollama host` read as expected for that box.
 2. **Column-name contract** — assert the post-rename frame has `atr_14`, `supertrend_dir`,
    `squeeze_mom`, `ema_200`, and that `_COLUMN_MAP`'s sources exist pre-rename. This is the
-   `ATRr_14` guard; run it before anything else touches the swing math.
+   `ATRr_14` guard; run it before anything else touches the swing math. Names confirmed against
+   live BBCA data (479 rows / 2y): `EMA_20`, `EMA_50`, `EMA_200`, `RSI_14`,
+   `MACD_12_26_9` + `MACDh_` + `MACDs_`, `SUPERT_7_3.0` + `SUPERTd_7_3.0`, `SQZ_20_2.0_20_1.5_LB`,
+   **`ATRr_14`**, `OBV`. Note `.history()` also returns `dividends` and `stock_splits` — drop them.
 3. **Indicator sanity** — `rsi_14` within [0,100]; `supertrend_dir` ∈ {1,−1}; `atr_14 > 0`; NaN
    prefixes only as long as each indicator's warm-up; `ema_200` non-NaN given 2y of history.
 4. **Tick rounding** — table-driven: 50→1, 360→2, 675→5, 4470→10, 6350→25 tick sizes; assert every
