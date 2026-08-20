@@ -1,163 +1,327 @@
-dc# Local IDX Finance AI Platform — Implementation Plan
+# Local IDX Swing-Trading AI Platform — Implementation Plan
 
-> Status: planned, not yet implemented. Last updated 2026-08-19.
+> Status: planned, not yet implemented. Last updated 2026-08-20.
 
 ## Context
 
-This repository is greenfield. We are building a 100% local (no paid APIs) Streamlit platform for the Indonesian market: an IDX stock screener (yfinance + technical indicators), a Reksa Dana screener (Playwright scraping into SQLite), and a local LLM "AI picks" engine via Ollama on `localhost:11434`.
+This repo is greenfield. The spec was revised from a general screener into a **daily swing-trading
+assistant**: the primary deliverable is now an actionable trade card per IDX ticker — ACTION, Entry,
+Stop-Loss at 1.5×ATR, Take-Profit at 3.0×ATR (1:2 R/R) — gated by hard quantitative rules, with a
+local Ollama model supplying the rationale. The screener and Reksa Dana tabs remain, demoted to
+Tabs 2 and 3.
 
-Live environment probes changed several things versus the original spec, and the plan below reflects them:
+This plan supersedes the earlier screener-first plan. It keeps the spec's exact 4-module / 3-tab
+layout (`tab_swing_picks.py` replaces the old `tab_ai_picks.py`) and carries forward two settled
+constraints from the previous round.
+
+### Verified findings driving the design
 
 | Finding | Consequence |
 |---|---|
-| Python **3.10.12**, numpy **2.2.6**, pandas **2.2.2** installed | Current PyPI `pandas_ta` (0.4.71b0) needs Python ≥3.12, so pip on 3.10 resolves to 0.3.14b0, which dies on numpy 2 (`from numpy import NaN`). → use **`pandas-ta-classic` 0.6.52** (Python ≥3.10, numpy ≥2, same `df.ta.*` API) |
-| `sqlite3` is stdlib | It **must not** appear in `requirements.txt` — `pip install sqlite3` fails |
-| yfinance verified working for IDX | `BBCA.JK` returned OHLCV plus `trailingPE` 13.46, `priceToBook`, `returnOnEquity`, `marketCap`, currency IDR — Module 2 is low-risk |
-| `pasardana.id/robots.txt` disallows `/api/`; its fund-search page renders **no** `<table>` server-side and shows Login/Sign In. `reksadana.ojk.go.id` rejects non-browser requests (WAF) | Module 3 gets a **pluggable adapter + CSV fallback + bundled sample data**, never touches `/api/`, and ships an `--inspect` mode to re-derive selectors when a site changes |
-| `ollama` binary not installed, `:11434` not listening | The graceful-degradation path in `ai_engine.py` is the *default* experience until Ollama is installed — it must be genuinely useful, not an afterthought |
+| Python **3.10.12**, numpy **2.2.6** | PyPI `pandas_ta` (0.4.71b0) needs Python ≥3.12; pip on 3.10 falls back to 0.3.14b0, which dies on numpy 2 (`from numpy import NaN`). → **`pandas-ta-classic` 0.6.52**, imported as `pandas_ta_classic as ta`, same `df.ta.*` API, has every indicator the spec needs |
+| `sqlite3` is stdlib | Must **not** go in `requirements.txt` — `pip install sqlite3` fails |
+| All 10 watchlist tickers verified live | BBCA 6350, BBRI 3130, BMRI 4150, TLKM 2610, ASII 4750, GOTO 50, ACES 360, BRMS 675, AMMN 4470, UNVR 1795 — 244 rows each, no gaps. `trailingPE`/`priceToBook`/`returnOnEquity` also available |
+| **`ta.atr(length=14)` emits `ATRr_14`, not `ATR_14`** | The name embeds `mamode` ("rma"). Hardcoding `ATR_14` silently KeyErrors — the most likely implementation bug here, and it sits directly on the stop-loss path |
+| `ta.supertrend(7, 3.0)` → `SUPERT_7_3.0`, **`SUPERTd_7_3.0`** (1=bull, −1=bear), `SUPERTl/s_7_3.0` | `SUPERTd` is the signal column the BUY gate reads |
+| `ta.squeeze(lazybear=True)` → `SQZ_20_2.0_20_1.5_LB` + `SQZ_ON`/`SQZ_OFF`/`SQZ_NO` | `lazybear=True` matches the TradingView "Squeeze Momentum [LazyBear]" the spec asks for; default (Carter TTM) drops the `_LB` suffix |
+| `supertrend` is `@njit`-decorated with a no-op fallback if numba is absent | `numba` is optional — correctness unaffected, speed is not. Listed as a commented optional dep |
+| `pasardana.id/robots.txt` disallows `/api/`; fund search renders no `<table>` server-side and shows Login. `reksadana.ojk.go.id` WAF-blocks non-browser requests | Mutual funds keep the adapter + CSV-fallback + sample-seed design; never request `/api/` |
+| `ollama` not installed, `:11434` not listening | Default state until installed — see the offline-resilience note below |
 
-Confirmed decisions: `pandas-ta-classic` for indicators · Plotly only for charts · adapter + CSV fallback for funds · code at repo root (no `local_finance_ai/` nesting).
+### Confirmed design decisions
+
+1. **Python computes every number; the LLM only narrates.** All arithmetic and gating happen in
+   `stock_data.py`. The model receives finished figures and returns only ACTION + RATIONALE; a
+   validator overrides any price it restates incorrectly, so a displayed price is always the Python
+   one. A 3B model cannot do this arithmetic reliably, and these are numbers someone might trade on.
+2. **Entry = today's close, explicitly labelled a reference price**, with ATR-implied gap risk shown
+   and a UI helper to recompute SL/TP from an actual fill.
+3. **Round SL/TP to valid IDX ticks** (fraksi harga). Without it the engine emits unplaceable prices
+   like a Rp6,127 stop on BBCA. Position sizing in lots and a liquidity guard were considered and
+   **deliberately excluded** from this scope.
+4. **Batch scan + on-demand narration.** Deterministically score all 10 tickers instantly (no LLM),
+   show a ranked gate table, narrate only what the user clicks.
+
+A consequence worth stating plainly: because Python owns the math, **Tab 1 is fully functional with
+Ollama offline** — Entry/SL/TP/gates all render; only the prose paragraph is missing. Graceful
+degradation stops being a consolation path and becomes a genuinely usable mode.
 
 ## Target structure
 
+Exactly the spec's layout, at repo root (no `local_finance_ai/` nesting):
+
 ```
 ai-stockanalysis/
-├── config.py                     # paths, Ollama endpoint, watchlist, indicator params, fund sources
-├── app.py                        # Streamlit entry point + option_menu nav
+├── config.py                 # Ollama settings, watchlist, indicator + risk params, IDX tick bands
+├── app.py                    # Streamlit entry, 3-tab nav, sidebar health panel
 ├── requirements.txt
-├── README.md
-├── .gitignore                    # .venv/, data/*.db, data/raw/, __pycache__/
+├── readme.md                 # this document
+├── .gitignore                # .venv/, data/*.db, data/raw/, __pycache__/
 ├── data/
-│   ├── raw/                      # scraper HTML dumps (--inspect) + user CSV drops
-│   └── sample_mutual_funds.csv   # bundled seed so Tab 2 always renders
+│   ├── raw/                  # scraper HTML dumps (--inspect) + user CSV drops
+│   └── sample_mutual_funds.csv
 ├── modules/
 │   ├── __init__.py
-│   ├── database.py               # SQLite schema, upserts, staleness checks
-│   ├── indicators.py             # isolates the pandas-ta-classic import (see rationale)
-│   ├── stock_data.py             # yfinance fetch + screener table + filters
-│   ├── mutual_funds.py           # Playwright adapters, CSV import, fund screening
-│   └── ai_engine.py              # Ollama client, prompts, verdict parsing
+│   ├── stock_data.py         # yfinance + indicator engine + swing math + tick rounding
+│   ├── mutual_funds.py       # Playwright adapters, CSV import, fund screening
+│   ├── database.py           # SQLite cache + fast screener queries
+│   └── ai_engine.py          # Ollama narration only (temperature 0.1)
 ├── ui/
 │   ├── __init__.py
-│   ├── tab_stocks.py
-│   ├── tab_mutual_funds.py
-│   └── tab_ai_picks.py
+│   ├── tab_swing_picks.py    # Tab 1 — AI Swing Trader
+│   ├── tab_stocks.py         # Tab 2 — Stock Screener
+│   └── tab_mutual_funds.py   # Tab 3 — Reksa Dana Screener
 └── scripts/
-    ├── refresh_prices.py         # CLI: warm the price/fundamentals cache
-    └── scrape_funds.py           # CLI: refresh | --inspect | --import-csv
+    ├── refresh_prices.py     # CLI: warm price/fundamentals cache (cron-able)
+    └── scrape_funds.py       # CLI: refresh | --inspect | --import-csv
 ```
 
-`indicators.py` is the one addition to the spec's module list. It exists so exactly one file imports the indicator library; if `pandas-ta-classic` ever breaks, we swap its internals and nothing else changes. `scripts/` exists so data refresh works headlessly (cron) without launching Streamlit.
+No extra module beyond the spec's four: the indicator import is isolated inside a marked section of
+`stock_data.py` behind one `_COLUMN_MAP`, rather than in a separate `indicators.py`. `scripts/`
+exists only so data refresh runs headlessly without Streamlit.
 
 ## Build order
 
-Checkpoint after Phase 1, per the original execution instruction, then proceed straight through.
+Checkpoint after Phase 2 (`requirements.txt` + `config.py` + `stock_data.py`), per the spec's
+initial execution step.
 
-### Phase 1 — Scaffold, `requirements.txt`, `config.py`
-
-`requirements.txt` (no `sqlite3`; comment saying why):
+### Phase 1 — `requirements.txt` + `config.py`
 
 ```
 streamlit>=1.39
 yfinance>=0.2.65
 pandas>=2.2
 numpy>=2.0
-pandas-ta-classic>=0.6.52   # pandas_ta itself needs Python >=3.12; this fork works on 3.10 + numpy 2
+pandas-ta-classic>=0.6.52   # pandas_ta needs Python >=3.12; this fork works on 3.10 + numpy 2
 playwright>=1.48
 ollama>=0.4
 plotly>=5.24
-streamlit-option-menu>=0.4.0
-lxml>=5.0                    # pandas.read_html backend for the fund scraper
+lxml>=5.0                   # pandas.read_html backend for the fund scraper
 beautifulsoup4>=4.12
+# numba                     # optional: JIT for SuperTrend; graceful no-op fallback without it
+# sqlite3 is Python stdlib — do not add it here, pip install sqlite3 fails
 ```
 
-`config.py` — module-level constants, no side effects beyond `mkdir(parents=True, exist_ok=True)` for `data/` and `data/raw/`:
+`config.py` — constants only, no side effects beyond `mkdir(parents=True, exist_ok=True)` on
+`data/` and `data/raw/`. Every value env-overridable so trying `qwen2.5` or a different ATR
+multiple needs no code edit.
 
-- Paths: `BASE_DIR`, `DATA_DIR`, `RAW_DIR`, `DB_PATH = DATA_DIR / "finance.db"`, `SAMPLE_FUND_CSV`
-- Ollama: `OLLAMA_HOST = "http://localhost:11434"`, `OLLAMA_MODEL = "llama3.2"`, `OLLAMA_TIMEOUT_S = 120`, `OLLAMA_TEMPERATURE = 0.2` — each overridable by env var so no code edit is needed to try `qwen2.5`
-- IDX: `IDX_SUFFIX = ".JK"`, `DEFAULT_WATCHLIST` of ~20 liquid names (BBCA, BBRI, BMRI, BBNI, TLKM, ASII, ICBP, INDF, UNVR, KLBF, ACES, AMRT, GOTO, ANTM, MDKA, ADRO, PGAS, EXCL, SMGR, TPIA) stored **without** suffix; `to_yf_symbol()` adds it
-- Indicators: `RSI_LENGTH = 14`, `MACD_FAST/SLOW/SIGNAL = 12/26/9`, `SMA_PERIODS = (20, 50, 200)`, `BB_LENGTH/BB_STD = 20/2.0`, `ATR_LENGTH = 14`
-- Cache TTLs: `PRICE_CACHE_TTL_HOURS = 12`, `FUNDAMENTALS_TTL_HOURS = 24`, `FUND_CACHE_TTL_HOURS = 24`
-- Screener defaults: `DEFAULT_RSI_MAX = 30`, `DEFAULT_PE_MAX = 15`, `DEFAULT_MIN_VOLUME`
-- Playwright: `PW_HEADLESS = True`, `PW_USER_AGENT`, `PW_LOCALE = "id-ID"`, `PW_TIMEZONE = "Asia/Jakarta"`, `PW_NAV_TIMEOUT_MS = 45_000`, `PW_REQUEST_DELAY_S = 2.0`
-- `FUND_SOURCES`: list of dicts — `{name, url, wait_selector, table_selector, column_map}` — so a site redesign is a config edit, not a code change. Ship with one best-effort public source enabled plus a comment recording that `/api/` is robots-disallowed and must not be requested.
+- `OLLAMA_HOST = "http://localhost:11434"`, `DEFAULT_MODEL = "llama3.2"`,
+  `OLLAMA_TEMPERATURE = 0.1`, `OLLAMA_TIMEOUT_S = 180`
+- `DATABASE_PATH = "data/finance.db"` (as a `BASE_DIR`-relative `Path`), `RAW_DIR`,
+  `SAMPLE_FUND_CSV`
+- `DEFAULT_WATCHLIST = ["BBCA","BBRI","BMRI","TLKM","ASII","GOTO","ACES","BRMS","AMMN","UNVR"]`
+  stored **without** suffix; `IDX_SUFFIX = ".JK"`
+- Indicators: `EMA_PERIODS = (20, 50, 200)`, `RSI_LENGTH = 14`, `MACD = (12, 26, 9)`,
+  `SUPERTREND_LENGTH = 7`, `SUPERTREND_MULT = 3.0`, `ATR_LENGTH = 14`, `SQUEEZE_LAZYBEAR = True`
+- Risk rules: `ATR_MULT_SL = 1.5`, `ATR_MULT_TP = 3.0`, `RSI_OVERBOUGHT = 70`, `TREND_EMA = 50`
+- `IDX_TICK_BANDS = [(200,1),(500,2),(2000,5),(5000,10),(None,25)]` — upper-bound-exclusive; in
+  config because IDX revises fraksi harga periodically
+- Cache TTLs: `PRICE_CACHE_TTL_HOURS = 12`, `FUNDAMENTALS_TTL_HOURS = 24`,
+  `FUND_CACHE_TTL_HOURS = 24`
+- Playwright: `PW_HEADLESS`, `PW_USER_AGENT`, `PW_LOCALE = "id-ID"`,
+  `PW_TIMEZONE = "Asia/Jakarta"`, `PW_NAV_TIMEOUT_MS = 45_000`, `PW_REQUEST_DELAY_S = 2.0`
+- `FUND_SOURCES`: `[{name, url, wait_selector, table_selector, column_map}]` so a site redesign is
+  a config edit; comment records that `/api/` is robots-disallowed
 
-### Phase 2 — `modules/database.py`
+### Phase 2 — `modules/stock_data.py` (the quantitative core)
 
-`sqlite3` only, WAL mode, `check_same_thread=False` (Streamlit reruns on other threads), a `@contextmanager get_connection()` that commits/rolls back.
+**Data**
 
-Tables created idempotently by `init_db()`:
-
-- `prices(ticker, date, open, high, low, close, adj_close, volume, PRIMARY KEY(ticker, date))`
-- `fundamentals(ticker PRIMARY KEY, long_name, sector, trailing_pe, price_to_book, market_cap, dividend_yield, roe, updated_at)`
-- `mutual_funds(id PK, fund_name, manager, category, nav, return_1y, aum, nav_date, source, scraped_at, UNIQUE(fund_name, nav_date))`
-- `ai_notes(id PK, ticker, model, rating, summary, payload, created_at)`
-- `meta(key PRIMARY KEY, value)` — refresh timestamps backing staleness checks
-
-API: `init_db()`, `upsert_prices(ticker, df)` / `load_prices(ticker, start=None)`, `upsert_fundamentals(ticker, dict)` / `load_fundamentals(tickers)`, `upsert_mutual_funds(rows)` / `load_mutual_funds(latest_only=True)`, `save_ai_note()` / `load_ai_notes(ticker)`, `set_meta()` / `get_meta()` / `is_stale(key, ttl_hours)`. All writes use `INSERT ... ON CONFLICT ... DO UPDATE` so re-running is safe.
-
-### Phase 3 — `modules/indicators.py` + `modules/stock_data.py`
-
-`indicators.py`:
-- One guarded import: try `pandas_ta_classic as ta`, then `pandas_ta as ta`, else raise a message naming the exact fix.
-- `add_all(df) -> DataFrame` computes RSI, MACD, SMA 20/50/200, Bollinger, ATR and **renames to stable snake_case** — `rsi_14`, `macd`, `macd_signal`, `macd_hist`, `sma_20/50/200`, `bb_lower/bb_mid/bb_upper`, `bb_pct`, `atr_14` — so UI and prompts never depend on library-specific column names.
-- `macd_state(df) -> "bullish_cross" | "bearish_cross" | "bullish" | "bearish"` from the last two bars.
-
-`stock_data.py`:
 - `to_yf_symbol(code)` / `strip_suffix(symbol)`.
-- `fetch_ohlcv(ticker, period="2y", interval="1d", use_cache=True)` — serve from SQLite when `not is_stale(...)`; otherwise `yf.Ticker(sym).history(auto_adjust=False)` per ticker (avoids the MultiIndex that `yf.download(group_by=...)` returns — confirmed in probing), normalize to lowercase columns, upsert, return. On any network/parse exception: log, fall back to cached rows, and surface a `stale=True` flag rather than raising.
-- `fetch_fundamentals(ticker)` — `Ticker.info` wrapped in try/except with per-key `.get()`; `.info` is the flakiest yfinance surface, so a failure yields `None` fields, never a crash.
-- `build_screener_table(tickers)` — one row per ticker: last close, % change 1d/1m/1y, `rsi_14`, MACD state, `above_sma200`, `bb_pct`, PE, PB, ROE, market cap, avg volume. Sequential fetch with request spacing and one bounded retry with backoff on rate-limit errors; per-ticker failures are collected and reported, not fatal.
-- `screen(table, criteria)` — pure pandas boolean masks over the already-built table (`rsi_max`, `rsi_min`, `above_sma200`, `pe_max`, `min_volume`, `sectors`). No network, so UI filtering is instant.
+- `fetch_ohlcv(ticker, period="2y", use_cache=True)` — serve from SQLite unless stale; else
+  `yf.Ticker(sym).history(auto_adjust=False)` **per ticker** (avoids the MultiIndex that
+  `yf.download(group_by=...)` returns — confirmed in probing), lowercase columns, upsert, return.
+  Any network/parse failure logs, falls back to cache, and sets a `stale` flag rather than raising.
+  2y of history is needed for a valid `ema_200`.
+- `fetch_fundamentals(ticker)` — `Ticker.info` in try/except with per-key `.get()`; `.info` is
+  yfinance's flakiest surface, so failure yields `None` fields, never a crash.
 
-### Phase 4 — `modules/mutual_funds.py` + `scripts/scrape_funds.py`
+**Indicator engine** — one guarded import (`pandas_ta_classic as ta`, falling back to `pandas_ta`,
+else a message naming the fix), then `add_indicators(df)` computing EMA 20/50/200, RSI 14,
+MACD(12,26,9), SuperTrend(7,3), Squeeze(LazyBear), ATR 14, OBV. Library columns are renamed through
+a single explicit `_COLUMN_MAP` to stable snake_case — `ema_20/50/200`, `rsi_14`, `macd`/
+`macd_signal`/`macd_hist`, `supertrend`, `supertrend_dir`, `squeeze_mom`, `squeeze_on`, `atr_14`,
+`obv` — so nothing downstream ever sees `ATRr_14` or `SUPERTd_7_3.0`. The map is asserted against
+the actual DataFrame after computation, so a library rename fails loudly at the boundary instead of
+producing a silent NaN stop-loss. Adds `obv_slope` (sign of OBV's 5-day linear fit) as the
+institutional-flow proxy the spec's "Bandarmology" note asks for.
+
+**Swing math**
+
+- `round_to_tick(price, mode)` — applies `IDX_TICK_BANDS`. SL rounds **down** and TP rounds **down**
+  (both conservative: a wider stop and a nearer target are the safe direction to err); entry rounds
+  to nearest.
+- `evaluate_swing_setup(snapshot) -> SwingPlan` — a frozen dataclass, pure function, no I/O:
+  - Gates, each recorded individually in `gate_results: dict[str, bool]` so the UI shows exactly
+    which rule failed: `close > ema_50`, `supertrend_dir == 1`,
+    `rsi_14 <= RSI_OVERBOUGHT` (the spec's rule is "do not buy if RSI > 70", so RSI exactly 70
+    passes).
+  - `action` = `BUY_AT_NEXT_OPEN` when all gates pass; `SELL` when
+    `supertrend_dir == -1 and close < ema_50`; otherwise `HOLD`.
+  - `entry` = last close, carrying an `entry_is_reference = True` flag;
+    `sl = round_to_tick(entry - 1.5*atr, "down")`; `tp = round_to_tick(entry + 3.0*atr, "down")`.
+  - `rr_ratio` computed **from the rounded prices**, not asserted to be 2.0 — after tick rounding
+    the true ratio drifts (e.g. GOTO at Rp50 with a Rp1 tick), and reporting a nominal 2.0 would be
+    false. Also carries `gap_risk_pct = atr/close` so the reference-price caveat is quantified.
+  - Guards: `None` when `atr_14` is NaN (insufficient history) or when `entry - sl <= 0` after
+    rounding, rather than emitting a degenerate plan.
+- `scan_watchlist(tickers) -> DataFrame` — one row per ticker with action, gate booleans,
+  entry/SL/TP, RR, RSI, SuperTrend state, squeeze state, OBV slope; ranked passers first. Sequential
+  fetch, spaced requests, one bounded retry with backoff on rate limits; per-ticker failures
+  collected and surfaced, never fatal.
+- `screen(table, criteria)` — pure pandas masks for Tab 2 (RSI range, PE max, SuperTrend bullish,
+  volume-spike ratio vs 20-day average, sector). No network, so filtering is instant.
+
+### Phase 3 — `modules/database.py`
+
+`sqlite3` only, WAL mode, `check_same_thread=False` (Streamlit reruns off-thread),
+`@contextmanager get_connection()` that commits/rolls back. `init_db()` is idempotent; all writes
+are `INSERT ... ON CONFLICT ... DO UPDATE` so re-runs are safe.
+
+- `prices(ticker, date, open, high, low, close, adj_close, volume, PK(ticker,date))`
+- `fundamentals(ticker PK, long_name, sector, trailing_pe, price_to_book, market_cap,
+  dividend_yield, roe, updated_at)`
+- `swing_plans(ticker, plan_date, action, entry, sl, tp, rr_ratio, atr, gates_json,
+  PK(ticker,plan_date))` — persists the deterministic plan so today's scan survives a rerun and
+  yesterday's decisions stay auditable
+- `ai_notes(id PK, ticker, plan_date, model, action, rationale, raw, created_at)` — narration kept
+  separate from the numbers, matching the architecture
+- `mutual_funds(id PK, fund_name, manager, category, nav, return_1y, aum, nav_date, source,
+  scraped_at, UNIQUE(fund_name, nav_date))`
+- `meta(key PK, value)` — refresh timestamps backing `is_stale(key, ttl_hours)`
+
+### Phase 4 — `modules/ai_engine.py` (narration only)
+
+- `check_ollama() -> (bool, str)` — `ollama.Client(host=OLLAMA_HOST).list()` in try/except over
+  connection/httpx/timeout errors; the failure string is actionable (install from ollama.com →
+  `ollama serve` → `ollama pull llama3.2`). `list_models()` feeds a model dropdown.
+- `SYSTEM_PROMPT` — the spec's disciplined-IDX-quant instruction plus three hard constraints:
+  prices are IDR; **the supplied Entry/SL/TP are final and must be quoted verbatim, never
+  recomputed**; say so plainly when an input is missing. Includes a not-investment-advice line.
+- `generate_swing_trade_plan(plan: SwingPlan, model=None) -> AINarration` (the spec's function
+  name) — renders the computed plan plus indicator context into the prompt, calls Ollama with
+  `options={"temperature": 0.1}`, requests `{"action", "rationale"}` JSON.
+  - **Validator**: any number in the response is checked against `plan`; mismatches beyond one tick
+    are stripped and replaced with the Python figure, and the substitution is flagged in the UI. A
+    returned `action` that contradicts the deterministic gates is overridden, with the disagreement
+    shown — the model narrates, it does not decide.
+  - JSON parse failure degrades to narrative-only text with `action=None`; never raises.
+  - Persists to `ai_notes`.
+- `stream_narration(...)` generator for `st.write_stream`, since a local model takes 30–60s on CPU.
+- Offline path returns `AINarration(available=False, message=...)` so callers render the full
+  numeric plan regardless.
+
+### Phase 5 — `modules/mutual_funds.py` + `scripts/scrape_funds.py`
 
 - `@dataclass FundRow(fund_name, manager, category, nav, return_1y, aum, nav_date, source)`.
-- `parse_id_number(text)` — Indonesian formatting: `1.234,56`, `Rp`, `%`, and `Miliar`/`Triliun` multipliers → float.
-- `TableAdapter`, driven entirely by a `FUND_SOURCES` entry: navigate → `wait_for_selector` → `page.content()` → `pandas.read_html(table_selector)` → apply `column_map` → `parse_id_number` → `FundRow`s. Adding a source is a config entry.
-- `scrape(sources=None, headless=None, inspect=False)` — sync Playwright API, one Chromium context with configured UA/locale/timezone, `PW_REQUEST_DELAY_S` between navigations, per-source try/except so one dead site doesn't kill the run. `inspect=True` writes `data/raw/<source>-<YYYYMMDD>.html` so selectors can be re-derived when a layout changes. Never requests a robots-disallowed path.
-- `import_csv(path)` — same `FundRow` schema; the guaranteed-working path given the login gates.
-- `load_or_seed()` — what the UI calls: return cached DB rows; if empty, import `data/sample_mutual_funds.csv` tagged `source="sample"` so the UI can show an honest "sample data — run the scraper or import a CSV" banner. **No fabricated data is ever presented as live**: the `source` and `scraped_at` columns are shown in the table.
+- `parse_id_number(text)` — Indonesian formats: `1.234,56`, `Rp`, `%`, `Miliar`/`Triliun`
+  multipliers → float.
+- `TableAdapter` driven entirely by a `FUND_SOURCES` entry: navigate → `wait_for_selector` →
+  `page.content()` → `pandas.read_html` → `column_map` → `parse_id_number` → `FundRow`s. Adding a
+  source is a config edit.
+- `scrape(sources=None, headless=None, inspect=False)` — sync Playwright, one Chromium context with
+  configured UA/locale/timezone, `PW_REQUEST_DELAY_S` between navigations, per-source try/except so
+  one dead site doesn't kill the run. `inspect=True` dumps `data/raw/<source>-<YYYYMMDD>.html` for
+  re-deriving selectors. Never requests a robots-disallowed path.
+- `import_csv(path)` — same schema; the reliable path given the login gates.
+- `load_or_seed()` — cached rows, or the bundled sample tagged `source="sample"`. **Sample data is
+  never presented as live**: `source` and `scraped_at` are columns in the table and drive a banner.
 - `screen_funds(df, categories, min_return_1y, min_aum)` — pure pandas.
-- `scripts/scrape_funds.py`: `--refresh` (default) · `--inspect` · `--import-csv PATH` · `--source NAME`.
-
-### Phase 5 — `modules/ai_engine.py`
-
-- `check_ollama() -> (bool, str)`: `ollama.Client(host=OLLAMA_HOST).list()` inside try/except for connection/httpx/timeout errors. Failure message is actionable and specific: install from ollama.com, `ollama serve`, `ollama pull llama3.2`. `list_models()` powers a model dropdown so the user isn't locked to `llama3.2`.
-- `SYSTEM_PROMPT`: the spec's disciplined-IDX-quant instruction, plus "all prices are IDR", "state uncertainty when data is missing", and an explicit not-investment-advice line.
-- `build_prompt(snapshot)`: ticker, name, sector, last close, 5d/20d/1y change, `rsi_14`, MACD state, price-vs-SMA20/50/200, `bb_pct`, ATR, PE/PB/ROE/market cap — with missing fields rendered as `n/a` rather than dropped, so the model can't silently assume.
-- `analyze_ticker(ticker, snapshot, model=None, stream=False) -> AIVerdict(rating, summary, entry, exit, risks, raw, model)`. Ask for a JSON object and parse it; on parse failure keep the narrative text and set `rating=None` — a malformed response degrades to "narrative only", never an exception. Persist to `ai_notes`.
-- `stream_analysis(...)` generator for `st.write_stream`, since local LLMs are slow enough that streaming matters.
+- CLI: `--refresh` (default) · `--inspect` · `--import-csv PATH` · `--source NAME`.
 
 ### Phase 6 — `app.py` + `ui/`
 
-- `app.py`: `st.set_page_config(page_title=..., layout="wide")`, `init_db()` once via `@st.cache_resource`, horizontal `option_menu` for the three tabs. Sidebar: Ollama status badge (green/red from `check_ollama()`), last price-refresh and last fund-scrape timestamps from `meta`, model selector, and refresh buttons.
-- `tab_stocks.py`: filter widgets (RSI range, `Price > SMA200`, max PE, min volume, sector multiselect) → `screen()` over a `@st.cache_data(ttl=...)`-wrapped `build_screener_table()`. Result in `st.dataframe(selection_mode="single-row")`; selecting a row renders a Plotly figure — candlestick + SMA overlays + Bollinger band, volume subplot, RSI subplot with 30/70 guides, MACD subplot with histogram. Failed tickers listed in an expander.
-- `tab_mutual_funds.py`: category multiselect, 1Y-return slider, min-AUM input, sortable table, "Refresh (Playwright)" button with a spinner and a clear warning that scraping takes ~30s, plus the sample/stale-data banner.
-- `tab_ai_picks.py`: watchlist ticker dropdown → snapshot built from `stock_data` + `indicators` → "Generate thesis" streams the response into a card with a colour-coded Bullish/Neutral/Bearish badge, entry/exit levels, risk bullets, the exact prompt in an expander, and previous verdicts for that ticker from `ai_notes`. When Ollama is down the button is disabled and the install steps are shown inline.
+`app.py`: `st.set_page_config(layout="wide")`, `init_db()` once via `@st.cache_resource`, three
+tabs. Sidebar: Ollama status badge from `check_ollama()`, model selector, last price-refresh / last
+fund-scrape timestamps from `meta`, refresh buttons.
 
-### Phase 7 — `README.md`
+- **Tab 1 `tab_swing_picks.py`** — "Run daily scan" builds `scan_watchlist()` instantly (no LLM)
+  into a ranked table with a gate-pass column and pass/fail chips per rule. Selecting a row shows
+  the daily candle summary plus the trade card: ACTION badge, Entry (labelled *reference —
+  recompute at your fill*), SL, TP, R/R after rounding, ATR and gap-risk %, and a number input that
+  recomputes SL/TP live from a real fill price. "Explain this setup" streams the rationale; with
+  Ollama down the card renders complete minus the prose, with install steps inline. Prompt visible
+  in an expander.
+- **Tab 2 `tab_stocks.py`** — filters (RSI range, max PE, SuperTrend bullish, volume-spike multiple,
+  sector) over a `@st.cache_data(ttl=...)`-wrapped scan; `st.dataframe(selection_mode="single-row")`
+  → Plotly figure: candlesticks with EMA 20/50/200 overlays and the SuperTrend line coloured by
+  direction, volume subplot, RSI subplot with 30/70 guides, MACD histogram subplot, squeeze-on
+  markers on the price axis. Failed tickers in an expander.
+- **Tab 3 `tab_mutual_funds.py`** — category multiselect, 1Y-return slider, min-AUM input, sortable
+  table, "Refresh (Playwright)" with a spinner and a ~30s warning, plus the sample/stale banner.
 
-Setup: create venv → `pip install -r requirements.txt` → `python -m playwright install chromium` → install Ollama and `ollama pull llama3.2` → `streamlit run app.py`. Plus: how to add a fund source to `FUND_SOURCES` using `--inspect`, how to import a CSV instead of scraping, the numpy-2/`pandas-ta-classic` rationale, and a not-investment-advice disclaimer.
+### Phase 7 — setup documentation
+
+Once code exists, this document is replaced by a genuine README (and the plan moves to `PLAN.md`)
+covering: venv → `pip install -r requirements.txt` → `python -m playwright install chromium` →
+install Ollama + `ollama pull llama3.2` → `streamlit run app.py`. Plus the numpy-2/
+`pandas-ta-classic` rationale, the `ATRr_14` naming trap, the Python-computes-math architecture and
+why, the reference-entry caveat, tick-rounding behaviour, how to add a fund source via `--inspect`,
+CSV import, and a prominent not-investment-advice disclaimer.
 
 ## Verification
 
-Run in order; each step is independently checkable.
-
-1. **Deps** — `python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt`, then `python -c "import pandas_ta_classic, streamlit, yfinance, plotly, ollama, playwright; print('ok')"`. This is the one genuinely unverified assumption (no installs were run during planning). If `pandas-ta-classic` fails on Python 3.10, replace only `indicators.py`'s internals with pandas-native RSI/MACD/SMA/Bollinger/ATR — the public API (`add_all`, `macd_state`) and every other module stay unchanged.
-2. **Browser** — `python -m playwright install chromium`.
-3. **DB** — `python -c "from modules.database import init_db; init_db()"`, then `sqlite3 data/finance.db ".tables"` shows all five tables.
-4. **Prices** — `python scripts/refresh_prices.py --tickers BBCA,TLKM`, then `sqlite3 data/finance.db "select ticker, count(*), max(date) from prices group by ticker"` returns non-zero counts with a recent max date.
-5. **Indicators** — one-liner asserting `add_all()` output contains `rsi_14`/`macd`/`sma_200`/`bb_upper`, that `rsi_14` is within [0, 100], and that only the expected leading NaNs exist.
-6. **Screener logic** — `screen()` with `rsi_max=100, pe_max=None` returns every row; with `rsi_max=0` returns none (boundary check on the filters).
-7. **Funds** — `python scripts/scrape_funds.py --inspect`, then confirm `data/raw/*.html` exists and check whether the configured selector matched. Expect selector tuning here given the login gates. Guaranteed path: `python scripts/scrape_funds.py --import-csv data/sample_mutual_funds.csv`, then confirm rows in `mutual_funds`.
-8. **Ollama down (current state)** — with nothing on `:11434`, `python -c "from modules.ai_engine import check_ollama; print(check_ollama())"` returns `(False, <install instructions>)` and the app still runs with Tabs 1–2 fully functional.
-9. **Ollama up** — after `ollama pull llama3.2`, `analyze_ticker("BBCA.JK", ...)` returns a verdict with a rating and a row lands in `ai_notes`.
-10. **End to end** — `streamlit run app.py`, then walk all three tabs: filter and chart a stock, filter funds, generate an AI thesis.
+1. **Deps** — `python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt`,
+   then `python -c "import pandas_ta_classic, streamlit, yfinance, plotly, ollama, playwright"`.
+   The one unverified assumption (planning ran no installs). If `pandas-ta-classic` fails on 3.10,
+   replace only the marked indicator section of `stock_data.py` with pandas-native
+   EMA/RSI/MACD/ATR/OBV plus a hand-rolled SuperTrend and Squeeze — `add_indicators()`'s output
+   contract is unchanged, so nothing else moves.
+2. **Column-name contract** — assert the post-rename frame has `atr_14`, `supertrend_dir`,
+   `squeeze_mom`, `ema_200`, and that `_COLUMN_MAP`'s sources exist pre-rename. This is the
+   `ATRr_14` guard; run it before anything else touches the swing math.
+3. **Indicator sanity** — `rsi_14` within [0,100]; `supertrend_dir` ∈ {1,−1}; `atr_14 > 0`; NaN
+   prefixes only as long as each indicator's warm-up; `ema_200` non-NaN given 2y of history.
+4. **Tick rounding** — table-driven: 50→1, 360→2, 675→5, 4470→10, 6350→25 tick sizes; assert every
+   rounded SL/TP is an exact multiple of its band's tick; check both sides of each boundary
+   (199/200, 499/500, 1999/2000, 4999/5000).
+5. **Swing math golden numbers** — for a fixed synthetic bar (entry 6350, ATR 150): pre-rounding SL
+   6125.0 and TP 6800.0, both already valid 25-ticks; then a case that *does* move under rounding
+   (entry 675, ATR 23 → SL 640.5→640, TP 744→740) and assert `rr_ratio` equals the recomputed
+   post-rounding ratio, not 2.0.
+6. **Gate logic** — RSI exactly 70 passes, 70.1 blocks; `close == ema_50` blocks (rule is strict
+   `>`); `supertrend_dir == -1` with `close < ema_50` yields SELL; a NaN ATR yields `None`, not a
+   plan.
+7. **DB** — `init_db()` then `sqlite3 data/finance.db ".tables"` shows all six tables; re-running
+   `init_db()` and a repeated upsert changes no row counts (idempotence).
+8. **Prices** — `python scripts/refresh_prices.py --tickers BBCA,GOTO,AMMN`, then
+   `select ticker, count(*), max(date) from prices group by ticker` returns ~500 rows each with a
+   recent max date.
+9. **Ollama offline (current state)** — with nothing on `:11434`, `check_ollama()` returns
+   `(False, <install steps>)` **and Tab 1 still renders complete Entry/SL/TP cards**. This is the
+   headline check for the chosen architecture.
+10. **Ollama online** — after `ollama pull llama3.2`, `generate_swing_trade_plan()` returns a
+    rationale, a row lands in `ai_notes`, and the validator is exercised by feeding a deliberately
+    wrong-number response through it to confirm the Python figure wins and the substitution is
+    flagged.
+11. **Funds** — `scripts/scrape_funds.py --inspect` writes `data/raw/*.html`; expect selector tuning
+    given the login gates. Guaranteed path: `--import-csv data/sample_mutual_funds.csv`, then
+    confirm `mutual_funds` rows.
+12. **End to end** — `streamlit run app.py`: run the daily scan, open a trade card, override the
+    fill price and watch SL/TP move, filter Tab 2 and chart a ticker, filter Tab 3.
 
 ## Risks
 
-- **`pandas-ta-classic` on Python 3.10** — the only install-time unknown; documented fallback in step 1 is contained to one file.
-- **Fund scraping** — the login gates and WAF mean the scrape may yield nothing without a logged-in session. Mitigated by the adapter/`--inspect`/CSV design and an honest sample-data banner; expect to iterate on selectors, and the CSV path is the reliable one.
-- **yfinance `.info`** — periodically breaks upstream and rate-limits. Every field access is guarded; a fundamentals outage degrades the screener to technical-only columns instead of failing.
-- **Local LLM latency** — a 3B model on CPU can take 30–60s per thesis; streaming plus cached `ai_notes` keeps the UI responsive.
+- **`pandas-ta-classic` install on Python 3.10** — the only install-time unknown; the fallback in
+  step 1 is contained to one marked section.
+- **Indicator column renames** — the concrete `ATRr_14` trap, mitigated by the step-2 assertion that
+  fails loudly rather than yielding a NaN stop.
+- **Reference-price entry** — a gap-up at the open invalidates the SL/TP pair. Mitigated by
+  labelling, the `gap_risk_pct` figure, and the fill-price recompute input; it remains an inherent
+  limitation of planning before the open.
+- **Fund scraping** — login gates and WAF mean a scrape may return nothing; the adapter/`--inspect`/
+  CSV design and honest banner absorb that, and CSV import is the reliable path.
+- **yfinance `.info`** — breaks upstream periodically and rate-limits; every access guarded, so a
+  fundamentals outage degrades Tab 2 to technical-only columns while Tab 1 (which needs no
+  fundamentals) is unaffected.
+- **Local LLM latency** — 30–60s per narration on CPU; batch scan is LLM-free and `ai_notes` caches
+  prose, so latency never blocks the daily overview.
+- **Out of scope by decision** — position sizing in lots and the liquidity guard. Worth revisiting:
+  without a liquidity check, a thin small cap can produce a plan that is not fillable at the stated
+  price.
+
+---
+
+*Nothing in this repository is investment advice. Signals are mechanical output from public data and
+a local language model; verify every number before risking capital.*
